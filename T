@@ -1,0 +1,98 @@
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+
+# Чтение данных
+data = pd.read_excel(
+  
+)
+
+check_raw = pd.read_excel(
+  
+)
+
+# Фильтрация origin
+filter_list = [
+  
+]
+
+filtered_check = check_raw[check_raw['Unnamed: 0'].isin(filter_list)]
+
+check = (
+    filtered_check[['Unnamed: 0', 'Unnamed: 3']]
+    .groupby('Unnamed: 0')['Unnamed: 3']
+    .sum()
+    .reset_index()
+)
+
+# План
+plan = dict(zip(
+    check['Unnamed: 0'].astype(str),
+    check['Unnamed: 3'].astype(float)
+))
+
+# Сортировка
+data = data.sort_values(['origin', 'month'])
+
+# Лаги
+data['volume_lag_1'] = data.groupby('origin')['volume'].shift(1)
+data['volume_lag_2'] = data.groupby('origin')['volume'].shift(2)
+data['volume_lag_3'] = data.groupby('origin')['volume'].shift(3)
+
+data = data.dropna(subset=['volume_lag_1', 'volume_lag_2', 'volume_lag_3'])
+
+# Модель
+X = data[['volume_lag_1', 'volume_lag_2', 'volume_lag_3']]
+X = sm.add_constant(X)
+y = data['volume']
+
+model = sm.OLS(y, X).fit()
+print(model.summary())
+
+# --- Прогноз ---
+target_origin = 'НОВОРОСЛАВСКАЯ'
+last_data = data[data['origin'] == target_origin]
+
+if len(last_data) >= 1:
+    last_lags = last_data[['volume_lag_1', 'volume_lag_2', 'volume_lag_3']].iloc[-1]
+
+    exog_for_pred = pd.DataFrame([last_lags.values], columns=[
+        'volume_lag_1', 'volume_lag_2', 'volume_lag_3'
+    ])
+    exog_for_pred = sm.add_constant(exog_for_pred, has_constant='add')
+
+    next_month_pred = model.predict(exog_for_pred)
+
+    print(f'Прогноз для {target_origin}: {next_month_pred.iloc[0]:.2f}')
+else:
+    print(f'Недостаточно данных для прогноза по {target_origin}')
+
+# --- Ограничения по плану ---
+last_month = data['month'].max()
+
+actual_by_origin = (
+    data[data['month'] == last_month]
+    .groupby('origin')['volume']
+    .sum()
+    .reset_index()
+)
+
+actual_by_origin['origin_str'] = actual_by_origin['origin'].astype(str)
+
+plan_df = pd.DataFrame({
+    'origin_str': list(plan.keys()),
+    'plan_volume': list(plan.values())
+})
+
+limits = pd.merge(actual_by_origin, plan_df, on='origin_str', how='left')
+
+# FIX: корректная логика срезки
+limits['final_volume'] = limits.apply(
+    lambda row: row['plan_volume']
+    if pd.notnull(row['plan_volume']) and row['volume'] > row['plan_volume']
+    else row['volume'],
+    axis=1
+)
+
+print('Результат с учётом ограничений:')
+print(limits[['origin', 'volume', 'plan_volume', 'final_volume']])
