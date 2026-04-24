@@ -1,0 +1,13 @@
+# OLS
+
+X_train_ols = sm.add_constant(X_train, has_constant='add')
+
+model_ols = sm.OLS(y_train, X_train_ols).fit()
+
+# выравнивание test
+X_test_ols = X_test.reindex(columns=X_train_ols.columns, fill_value=0)
+
+# типы
+X_test_ols = X_test_ols.astype(float)
+
+pred_ols = model_ols.predict(X_test_ols)
