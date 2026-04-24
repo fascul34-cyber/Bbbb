@@ -1,0 +1,128 @@
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+
+# =========================
+# 📥 DATA
+# =========================
+
+data = pd.read_excel(
+    ''
+)
+
+check_raw = pd.read_excel(
+    './
+)
+
+# =========================
+# 📊 PLAN
+# =========================
+
+filter_list = [
+    ']
+
+filtered_check = check_raw[check_raw['Unnamed: 0'].isin(filter_list)]
+
+check = (
+    filtered_check[['Unnamed: 0', 'Unnamed: 3']]
+    .groupby('Unnamed: 0')['Unnamed: 3']
+    .sum()
+    .reset_index()
+)
+
+plan_df = pd.DataFrame({
+    'origin': check['Unnamed: 0'].astype(str),
+    'plan_volume': check['Unnamed: 3'].astype(float)
+})
+
+# =========================
+# 🧠 LAGS
+# =========================
+
+group_cols = ['origin', 'destination', 'cargo_type', 'speed']
+
+data = data.sort_values(group_cols + ['month'])
+
+data['volume_lag_1'] = data.groupby(group_cols)['volume'].shift(1)
+data['volume_lag_2'] = data.groupby(group_cols)['volume'].shift(2)
+data['volume_lag_3'] = data.groupby(group_cols)['volume'].shift(3)
+
+data = data.dropna(subset=['volume_lag_1','volume_lag_2','volume_lag_3'])
+
+# =========================
+# 🏗 MODEL DATA
+# =========================
+
+cat_cols = ['origin','destination','cargo_type','speed']
+
+data_model = pd.get_dummies(data, columns=cat_cols, drop_first=True)
+
+# ❗ CRITICAL FIX 1: убрать NaN/inf
+data_model = data_model.replace([np.inf, -np.inf], np.nan).dropna()
+
+# ❗ CRITICAL FIX 2: оставить только числовые
+X = data_model.drop(columns=['volume']).select_dtypes(include=[np.number])
+y = data_model['volume'].astype(float)
+
+# add constant safely
+X = sm.add_constant(X, has_constant='add')
+
+# ❗ CRITICAL FIX 3: final cleanup
+X = X.astype(float)
+y = y.astype(float)
+
+# =========================
+# 🧠 MODEL
+# =========================
+
+model = sm.OLS(y, X).fit()
+print(model.summary())
+
+# =========================
+# 🔮 FORECAST
+# =========================
+
+future = data.groupby(group_cols).tail(1).copy()
+
+future_features = future[[
+    'volume_lag_1','volume_lag_2','volume_lag_3',
+    'origin','destination','cargo_type','speed'
+]]
+
+future_encoded = pd.get_dummies(
+    future_features,
+    columns=cat_cols,
+    drop_first=True
+)
+
+# align columns with model
+future_encoded = future_encoded.reindex(columns=X.columns, fill_value=0)
+
+future['pred'] = model.predict(future_encoded)
+
+# =========================
+# 📉 PLAN CONSTRAINT
+# =========================
+
+future = future.merge(plan_df, on='origin', how='left')
+
+future['sum_pred_origin'] = future.groupby('origin')['pred'].transform('sum')
+
+future['scale'] = np.where(
+    future['plan_volume'].notna(),
+    future['plan_volume'] / future['sum_pred_origin'],
+    1
+)
+
+future['final_pred'] = future['pred'] * future['scale']
+
+# =========================
+# 📊 RESULT
+# =========================
+
+print(
+    future[[
+        'origin','destination','cargo_type','speed',
+        'pred','final_pred','plan_volume'
+    ]].sort_values(['origin','destination'])
+)
