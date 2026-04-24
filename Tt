@@ -1,0 +1,128 @@
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+
+# =========================
+# 📥 ЗАГРУЗКА ДАННЫХ
+# =========================
+
+data = pd.read_excel(
+    
+
+check_raw = pd.read_excel(
+    
+)
+
+# =========================
+# 📊 ПОДГОТОВКА ПЛАНА
+# =========================
+
+filter_list = [
+    ']
+
+filtered_check = check_raw[check_raw['Unnamed: 0'].isin(filter_list)]
+
+check = (
+    filtered_check[['Unnamed: 0', 'Unnamed: 3']]
+    .groupby('Unnamed: 0')['Unnamed: 3']
+    .sum()
+    .reset_index()
+)
+
+plan_df = pd.DataFrame({
+    'origin': check['Unnamed: 0'].astype(str),
+    'plan_volume': check['Unnamed: 3'].astype(float)
+})
+
+plan = dict(zip(plan_df['origin'], plan_df['plan_volume']))
+
+# =========================
+# 🧠 ЛАГИ
+# =========================
+
+group_cols = ['origin', 'destination', 'cargo_type', 'speed']
+
+data = data.sort_values(group_cols + ['month'])
+
+data['volume_lag_1'] = data.groupby(group_cols)['volume'].shift(1)
+data['volume_lag_2'] = data.groupby(group_cols)['volume'].shift(2)
+data['volume_lag_3'] = data.groupby(group_cols)['volume'].shift(3)
+
+data = data.dropna(subset=['volume_lag_1', 'volume_lag_2', 'volume_lag_3'])
+
+# =========================
+# 🏗 МОДЕЛЬ
+# =========================
+
+cat_cols = ['origin', 'destination', 'cargo_type', 'speed']
+
+data_model = pd.get_dummies(data, columns=cat_cols, drop_first=True)
+
+X = data_model.drop(columns=['volume'])
+y = data_model['volume']
+
+X = sm.add_constant(X)
+
+model = sm.OLS(y, X).fit()
+
+print(model.summary())
+
+# =========================
+# 🔮 ПРОГНОЗ ПО ВСЕМ OD
+# =========================
+
+future = data.groupby(group_cols).tail(1).copy()
+
+future_features = future[[
+    'volume_lag_1',
+    'volume_lag_2',
+    'volume_lag_3',
+    'origin',
+    'destination',
+    'cargo_type',
+    'speed'
+]]
+
+future_encoded = pd.get_dummies(
+    future_features,
+    columns=cat_cols,
+    drop_first=True
+)
+
+future_encoded = future_encoded.reindex(columns=X.columns, fill_value=0)
+
+future['pred'] = model.predict(future_encoded)
+
+# =========================
+# 📉 ОГРАНИЧЕНИЕ ПО ПЛАНУ
+# =========================
+
+future = future.merge(plan_df, on='origin', how='left')
+
+# сумма прогноза по origin
+future['sum_pred_origin'] = future.groupby('origin')['pred'].transform('sum')
+
+# коэффициент масштабирования
+future['scale'] = np.where(
+    future['plan_volume'].notna(),
+    future['plan_volume'] / future['sum_pred_origin'],
+    1
+)
+
+future['final_pred'] = future['pred'] * future['scale']
+
+# =========================
+# 📊 РЕЗУЛЬТАТ
+# =========================
+
+result = future[[
+    'origin',
+    'destination',
+    'cargo_type',
+    'speed',
+    'pred',
+    'final_pred',
+    'plan_volume'
+]]
+
+print(result.sort_values(['origin','destination']))
