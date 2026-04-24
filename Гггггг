@@ -1,0 +1,20 @@
+# X / y
+X_train = train_model.drop(columns=['volume']).select_dtypes(include=[np.number])
+y_train = train_model['volume']
+
+X_test = test_model.drop(columns=['volume']).select_dtypes(include=[np.number])
+y_test = test_model['volume']
+
+# ❗ КРИТИЧЕСКОЕ ВЫРАВНИВАНИЕ
+X_test = X_test.reindex(columns=X_train.columns, fill_value=0)
+
+# типы
+X_train = X_train.astype(float)
+X_test = X_test.astype(float)
+y_train = y_train.astype(float)
+
+# Ridge
+model_ridge = Ridge(alpha=1.0)
+model_ridge.fit(X_train, y_train)
+
+pred_ridge = model_ridge.predict(X_test)
