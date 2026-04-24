@@ -1,0 +1,121 @@
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+
+# =========================
+# 📥 DATA
+# =========================
+
+data = pd.read_excel(
+    
+)
+
+# =========================
+# 🧠 LAGS
+# =========================
+
+group_cols = ['origin','destination','cargo_type','speed']
+
+data = data.sort_values(group_cols + ['month'])
+
+data['volume_lag_1'] = data.groupby(group_cols)['volume'].shift(1)
+data['volume_lag_2'] = data.groupby(group_cols)['volume'].shift(2)
+data['volume_lag_3'] = data.groupby(group_cols)['volume'].shift(3)
+
+data = data.dropna(subset=['volume_lag_1','volume_lag_2','volume_lag_3'])
+
+# =========================
+# 📅 MONTHS
+# =========================
+
+months = sorted(data['month'].unique())
+
+results = []
+
+# =========================
+# 🔁 ROLLING BACKTEST
+# =========================
+
+for i in range(3, len(months)):
+
+    train_months = months[:i]
+    test_month = months[i]
+
+    train = data[data['month'].isin(train_months)].copy()
+    test = data[data['month'] == test_month].copy()
+
+    cat_cols = ['origin','destination','cargo_type','speed']
+
+    train_model = pd.get_dummies(train, columns=cat_cols, drop_first=True)
+    test_model = pd.get_dummies(test, columns=cat_cols, drop_first=True)
+
+    # выравнивание колонок
+    train_model, test_model = train_model.align(test_model, join='left', axis=1, fill_value=0)
+
+    # X / y
+    X_train = train_model.drop(columns=['volume']).select_dtypes(include=[np.number])
+    y_train = train_model['volume']
+
+    X_test = test_model.drop(columns=['volume']).select_dtypes(include=[np.number])
+    y_test = test_model['volume']
+
+    # =========================
+    # 🧠 OLS
+    # =========================
+
+    X_train_ols = sm.add_constant(X_train, has_constant='add')
+    X_test_ols = sm.add_constant(X_test, has_constant='add')
+
+    model_ols = sm.OLS(y_train, X_train_ols).fit()
+    pred_ols = model_ols.predict(X_test_ols)
+
+    # =========================
+    # 🧠 RIDGE
+    # =========================
+
+    model_ridge = Ridge(alpha=1.0)
+    model_ridge.fit(X_train, y_train)
+    pred_ridge = model_ridge.predict(X_test)
+
+    # =========================
+    # 📊 METRICS
+    # =========================
+
+    def mape(y_true, y_pred):
+        return np.mean(
+            np.abs((y_true - y_pred) / np.where(y_true == 0, 1, y_true))
+        ) * 100
+
+    results.append({
+        'month': test_month,
+
+        'MAE_OLS': mean_absolute_error(y_test, pred_ols),
+        'RMSE_OLS': np.sqrt(mean_squared_error(y_test, pred_ols)),
+        'MAPE_OLS': mape(y_test, pred_ols),
+
+        'MAE_RIDGE': mean_absolute_error(y_test, pred_ridge),
+        'RMSE_RIDGE': np.sqrt(mean_squared_error(y_test, pred_ridge)),
+        'MAPE_RIDGE': mape(y_test, pred_ridge),
+    })
+
+# =========================
+# 📊 RESULTS
+# =========================
+
+results_df = pd.DataFrame(results)
+
+print(results_df)
+
+print("\n=== AVERAGE METRICS ===\n")
+
+print("OLS:")
+print("MAE:", results_df['MAE_OLS'].mean())
+print("RMSE:", results_df['RMSE_OLS'].mean())
+print("MAPE:", results_df['MAPE_OLS'].mean())
+
+print("\nRIDGE:")
+print("MAE:", results_df['MAE_RIDGE'].mean())
+print("RMSE:", results_df['RMSE_RIDGE'].mean())
+print("MAPE:", results_df['MAPE_RIDGE'].mean())
