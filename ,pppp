@@ -1,0 +1,155 @@
+import pandas as pd
+import numpy as np
+from catboost import CatBoostRegressor
+
+# ======================
+# 1. Подготовка данных
+# ======================
+
+df = data.copy()
+
+# подтягиваем план
+df = df.merge(plan, on=['origin', 'month'], how='left')
+
+# защита
+df = df[df['plan_volume'] > 0].copy()
+
+# таргет = доля от плана
+df['target'] = df['volume'] / df['plan_volume']
+
+# убираем мусор
+df = df[df['target'] > 0.001].copy()
+
+# сортировка
+group_cols = ['origin', 'destination', 'cargo_type', 'speed']
+df = df.sort_values(group_cols + ['month'])
+
+# ======================
+# 2. Фичи
+# ======================
+
+# лаги таргета
+for lag in [1, 2, 3]:
+    df[f'target_lag_{lag}'] = df.groupby(group_cols)['target'].shift(lag)
+
+# rolling
+df['target_roll_3'] = df.groupby(group_cols)['target'] \
+    .transform(lambda x: x.shift(1).rolling(3).mean())
+
+# сезонность
+df['month_num'] = df['month'] % 12
+df['month_sin'] = np.sin(2 * np.pi * df['month_num'] / 12)
+df['month_cos'] = np.cos(2 * np.pi * df['month_num'] / 12)
+
+# фичи плана
+df['plan_lag_1'] = df.groupby('origin')['plan_volume'].shift(1)
+df['plan_ratio'] = df['plan_volume'] / df['plan_lag_1']
+
+# чистим NaN
+df = df.dropna().copy()
+
+# ======================
+# 3. Train / Val
+# ======================
+
+train = df[df['month'] > 6]
+val   = df[df['month'] <= 6]
+
+cat_features = ['origin', 'destination', 'cargo_type', 'speed']
+
+features = [
+    'origin', 'destination', 'cargo_type', 'speed',
+    'target_lag_1', 'target_lag_2', 'target_lag_3',
+    'target_roll_3',
+    'month_sin', 'month_cos',
+    'plan_volume',
+    'plan_lag_1',
+    'plan_ratio',
+]
+
+# ======================
+# 4. Обучение
+# ======================
+
+model = CatBoostRegressor(
+    iterations=500,
+    depth=6,
+    learning_rate=0.05,
+    loss_function='RMSE',
+    verbose=100
+)
+
+model.fit(
+    train[features],
+    train['target'],
+    cat_features=cat_features,
+    eval_set=(val[features], val['target'])
+)
+
+# ======================
+# 5. Подготовка прогноза
+# ======================
+
+last_month = df['month'].max()
+pred_month = last_month + 1
+
+# базовые сцепки
+last_df = df[df['month'] == last_month].copy()
+base = last_df[group_cols].drop_duplicates().copy()
+
+# лаги таргета
+lags = last_df[group_cols + [
+    'target_lag_1', 'target_lag_2', 'target_lag_3'
+]]
+
+base = base.merge(lags, on=group_cols, how='left')
+
+# план на будущий месяц
+plan_future = plan[plan['month'] == pred_month][['origin', 'plan_volume']]
+
+base = base.merge(plan_future, on='origin', how='left')
+
+# plan_lag_1 (из последнего месяца)
+plan_last = plan[plan['month'] == last_month][['origin', 'plan_volume']] \
+    .rename(columns={'plan_volume': 'plan_lag_1'})
+
+base = base.merge(plan_last, on='origin', how='left')
+
+# ratio
+base['plan_ratio'] = base['plan_volume'] / base['plan_lag_1']
+
+# ======================
+# 6. Остальные фичи
+# ======================
+
+base['month'] = pred_month
+base['month_num'] = base['month'] % 12
+
+base['month_sin'] = np.sin(2 * np.pi * base['month_num'] / 12)
+base['month_cos'] = np.cos(2 * np.pi * base['month_num'] / 12)
+
+# заполняем лаги
+lag_cols = ['target_lag_1', 'target_lag_2', 'target_lag_3']
+base[lag_cols] = base[lag_cols].fillna(0)
+
+# rolling
+base['target_roll_3'] = base[lag_cols].mean(axis=1)
+
+# ======================
+# 7. Прогноз
+# ======================
+
+base['target_pred'] = model.predict(base[features])
+
+# убираем мусор
+base['target_pred'] = base['target_pred'].clip(lower=0)
+
+# нормализация (важно!)
+base['target_pred'] = base.groupby('origin')['target_pred'] \
+    .transform(lambda x: x / x.sum())
+
+# ======================
+# 8. Перевод в объем
+# ======================
+
+base['volume_pred'] = base['target_pred'] * base['plan_volume']
