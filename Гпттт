@@ -1,0 +1,137 @@
+import pandas as pd
+import numpy as np
+from catboost import CatBoostRegressor
+
+# ======================
+# 1. Подготовка данных
+# ======================
+
+df = data.copy()
+
+# сумма по origin + месяц
+df['origin_volume'] = df.groupby(['origin', 'month'])['volume'].transform('sum')
+
+# доля
+df['share'] = df['volume'] / df['origin_volume']
+
+# убираем мусор
+df = df[df['share'] > 0.001].copy()
+
+# сортировка
+df = df.sort_values(['origin', 'destination', 'cargo_type', 'speed', 'month'])
+
+group_cols = ['origin', 'destination', 'cargo_type', 'speed']
+
+# ======================
+# 2. Фичи
+# ======================
+
+# лаги
+for lag in [1, 2, 3]:
+    df[f'share_lag_{lag}'] = df.groupby(group_cols)['share'].shift(lag)
+
+# rolling (только по прошлым значениям!)
+df['share_roll_3'] = df.groupby(group_cols)['share'] \
+    .transform(lambda x: x.shift(1).rolling(3).mean())
+
+# сезонность
+df['month_num'] = df['month'] % 12
+
+df['month_sin'] = np.sin(2 * np.pi * df['month_num'] / 12)
+df['month_cos'] = np.cos(2 * np.pi * df['month_num'] / 12)
+
+# удаляем NaN после лагов
+df = df.dropna().copy()
+
+# ======================
+# 3. Train / Val
+# ======================
+
+train = df[df['month'] > 6]
+val   = df[df['month'] <= 6]
+
+cat_features = ['origin', 'destination', 'cargo_type', 'speed']
+
+features = [
+    'origin', 'destination', 'cargo_type', 'speed',
+    'share_lag_1', 'share_lag_2', 'share_lag_3',
+    'share_roll_3',
+    'month_sin', 'month_cos',
+]
+
+# ======================
+# 4. Обучение
+# ======================
+
+model = CatBoostRegressor(
+    iterations=500,
+    depth=6,
+    learning_rate=0.05,
+    loss_function='RMSE',
+    verbose=100
+)
+
+model.fit(
+    train[features],
+    train['share'],
+    cat_features=cat_features,
+    eval_set=(val[features], val['share'])
+)
+
+# ======================
+# 5. Подготовка к прогнозу
+# ======================
+
+# последний месяц
+last_month = df['month'].max()
+
+# берём только последний срез
+last_df = df[df['month'] == last_month].copy()
+
+# базовые комбинации
+base = last_df[group_cols].drop_duplicates().copy()
+
+# добавляем лаги прямо из last_df
+lags = last_df[group_cols + ['share_lag_1', 'share_lag_2', 'share_lag_3']]
+
+base = base.merge(lags, on=group_cols, how='left')
+
+# ======================
+# 6. Фичи для прогноза
+# ======================
+
+pred_month = last_month + 1
+
+base['month'] = pred_month
+base['month_num'] = base['month'] % 12
+
+base['month_sin'] = np.sin(2 * np.pi * base['month_num'] / 12)
+base['month_cos'] = np.cos(2 * np.pi * base['month_num'] / 12)
+
+# заполняем NaN
+lag_cols = ['share_lag_1', 'share_lag_2', 'share_lag_3']
+base[lag_cols] = base[lag_cols].fillna(0)
+
+# rolling из лагов
+base['share_roll_3'] = base[lag_cols].mean(axis=1)
+
+# ======================
+# 7. Прогноз долей
+# ======================
+
+base['share_pred'] = model.predict(base[features])
+
+# убираем отрицательные
+base['share_pred'] = base['share_pred'].clip(lower=0)
+
+# нормализация (чтобы сумма = 1 по origin)
+base['share_pred'] = base.groupby('origin')['share_pred'] \
+    .transform(lambda x: x / x.sum())
+
+# ======================
+# 8. Перевод в объем
+# ======================
+
+result = base.merge(plan, on='origin', how='left')
+
+result['volume_pred'] = result['share_pred'] * result['volume']
