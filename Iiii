@@ -1,0 +1,223 @@
+import pandas as pd
+import psycopg2
+import numpy as np
+from sklearn.linear_model import LinearRegression
+
+# ------------------ ПАРАМЕТРЫ ------------------
+CUTOFF_DATE = "2026-03-01"
+N_MONTHS = 3
+MIN_ACTIVE_MONTHS = 2
+TRAIN_COUNT = 10
+MIN_WAGONS = 3
+
+R2_THRESHOLD = 0.3
+ERROR_THRESHOLD = 0.3
+
+
+# ------------------ ЗАГРУЗКА ------------------
+def get_query(query: str) -> pd.DataFrame:
+    with psycopg2.connect(
+        user="",
+        password="***",
+        host="***",
+        port="",
+        database=""
+    ) as conn:
+        return pd.read_sql_query(query, conn)
+
+
+df_raw = get_query("""SELECT * FROM MART.daria_data_rachet_delenie_obion""")
+plan_raw = get_query("""SELECT * FROM MART.daria_aktualnyj_plan_correktirovki""")
+plan_fact_raw = get_query("""SELECT * FROM MART.daria_actual_plan""")
+
+
+# ------------------ ПОДГОТОВКА ------------------
+df = df_raw.copy()
+df['date'] = pd.to_datetime(df['date'])
+df = df[df['date'] < CUTOFF_DATE]
+df['month'] = df['date'].dt.to_period("M")
+
+# ------------------ ФИЛЬТР ПО МЕСЯЦАМ ------------------
+last_month = df['month'].max()
+recent_months = [last_month - i for i in range(N_MONTHS)]
+
+def keep_group(x):
+    active = x[x['volume'] > 0]['month'].unique()
+    return len(set(active) & set(recent_months)) >= MIN_ACTIVE_MONTHS
+
+df = df.groupby(
+    ['origin', 'destination', 'cargo_type', 'speed']
+).filter(keep_group)
+
+print("После фильтра месяцев:", df['destination'].nunique())
+
+
+# ------------------ PLAN FACT ------------------
+plan_fact = plan_fact_raw.copy()
+plan_fact['date'] = pd.to_datetime(plan_fact['date'])
+plan_fact['month'] = plan_fact['date'].dt.to_period("M")
+
+plan_fact = plan_fact.groupby(
+    ['origin', 'destination', 'cargo_type', 'speed', 'month'],
+    as_index=False
+)[['volume', 'wagons']].sum()
+
+valid_pairs = plan_fact[
+    (plan_fact['month'] == last_month) &
+    (plan_fact['wagons'] >= TRAIN_COUNT)
+][['origin', 'destination', 'cargo_type', 'speed']]
+
+df['is_valid'] = df.merge(
+    valid_pairs,
+    on=['origin', 'destination', 'cargo_type', 'speed'],
+    how='left',
+    indicator=True
+)['_merge'] == 'both'
+
+print("После valid_pairs:", df['destination'].nunique())
+
+
+# ------------------ PLAN ------------------
+plan = plan_raw.copy()
+plan['date'] = pd.to_datetime(plan['date'])
+plan = plan[plan['date'] == CUTOFF_DATE]
+
+plan_grouped = plan.groupby('origin', as_index=False)['volume'].sum()
+total_volume_by_origin = dict(zip(plan_grouped['origin'], plan_grouped['volume']))
+
+
+# ------------------ ПРОГНОЗ (LinearRegression + fallback) ------------------
+def predict_with_fallback(group):
+    group = group.sort_values('month')
+    volumes = group['volume'].values
+    n = len(volumes)
+
+    # мало данных → веса
+    if n < 3:
+        weights = np.array([0.1, 0.1, 0.8][-n:])
+        weights = weights / weights.sum()
+        return (volumes * weights).sum()
+
+    X = np.arange(n).reshape(-1, 1)
+    y = volumes
+
+    model = LinearRegression()
+    model.fit(X, y)
+
+    # --- качество модели ---
+    r2 = model.score(X, y)
+
+    pred_last = model.predict([[n - 1]])[0]
+    actual_last = y[-1]
+
+    if actual_last == 0:
+        error = 0
+    else:
+        error = abs(pred_last - actual_last) / actual_last
+
+    # --- fallback ---
+    if (r2 < R2_THRESHOLD) or (error > ERROR_THRESHOLD):
+        weights = np.array([0.1, 0.1, 0.8])
+        return (y[-3:] * weights).sum()
+
+    # --- прогноз ---
+    pred_next = model.predict([[n]])[0]
+
+    pred_next = max(pred_next, 0)
+
+    cap = y.mean() * 2
+    pred_next = min(pred_next, cap)
+
+    return pred_next
+
+
+# считаем weighted_volume
+rows = []
+
+for (origin, dest, cargo, speed), group in df.groupby(
+    ['origin', 'destination', 'cargo_type', 'speed']
+):
+    weighted_volume = predict_with_fallback(group)
+
+    rows.append({
+        'origin': origin,
+        'destination': dest,
+        'cargo_type': cargo,
+        'speed': speed,
+        'weighted_volume': weighted_volume
+    })
+
+grouped = pd.DataFrame(rows)
+
+
+# ------------------ РАСПРЕДЕЛЕНИЕ ------------------
+result = []
+
+for origin, total_vol in total_volume_by_origin.items():
+    sub = grouped[grouped['origin'] == origin].copy()
+
+    if sub.empty:
+        continue
+
+    total_weight = sub['weighted_volume'].sum()
+
+    if total_weight == 0:
+        sub['share'] = 1 / len(sub)
+    else:
+        sub['share'] = sub['weighted_volume'] / total_weight
+
+    sub['forecast_volume'] = sub['share'] * total_vol
+
+    result.append(sub)
+
+forecast_df = pd.concat(result, ignore_index=True)
+
+print("После forecast:", forecast_df['destination'].nunique())
+
+
+# ------------------ ОБЪЕМ НА ВАГОН ------------------
+plan_fact['vol_per_wagon'] = plan_fact['volume'] / plan_fact['wagons']
+plan_fact = plan_fact.replace([np.inf, -np.inf], np.nan).dropna()
+
+wagon_metrics = plan_fact.groupby(
+    ['origin', 'destination', 'cargo_type', 'speed'],
+    as_index=False
+)['vol_per_wagon'].median()
+
+forecast_df = forecast_df.merge(
+    wagon_metrics,
+    on=['origin', 'destination', 'cargo_type', 'speed'],
+    how='left'
+)
+
+# fallback если нет данных
+forecast_df['vol_per_wagon'] = forecast_df['vol_per_wagon'].fillna(
+    forecast_df['forecast_volume'].mean() / 10
+)
+
+# минимум 3 вагона
+forecast_df['min_volume'] = forecast_df['vol_per_wagon'] * MIN_WAGONS
+
+
+# ------------------ ФИЛЬТР ------------------
+forecast_df['is_big'] = (
+    forecast_df['forecast_volume'] >= forecast_df['min_volume']
+)
+
+small = forecast_df[~forecast_df['is_big']].copy()
+small[['destination', 'cargo_type', 'speed']] = 'прочее'
+
+big = forecast_df[forecast_df['is_big']]
+
+forecast_final = pd.concat([big, small], ignore_index=True)
+
+forecast_final = forecast_final.groupby(
+    ['origin', 'destination', 'cargo_type', 'speed'],
+    as_index=False
+)['forecast_volume'].sum()
+
+print("ФИНАЛ направлений:", forecast_final['destination'].nunique())
+
+
+# ------------------ СОХРАНЕНИЕ ------------------
+forecast_final.to_excel("output_forecast.xlsx", index=False)
