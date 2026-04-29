@@ -1,0 +1,43 @@
+# ------------------ ФИЛЬТР СЛАБЫХ СТАНЦИЙ ------------------
+ORIGIN_VOLUME_THRESHOLD = 30
+ORIGIN_N_MONTHS = 3  # можно менять
+
+
+last_month = df['month'].max()
+recent_months = [last_month - i for i in range(ORIGIN_N_MONTHS)]
+
+# суммарный объем по станции в месяц
+origin_monthly = df[df['month'].isin(recent_months)].groupby(
+    ['origin', 'month'],
+    as_index=False
+)['volume'].sum()
+
+# средний объем по станции
+origin_avg = origin_monthly.groupby('origin')['volume'].mean().reset_index()
+origin_avg = origin_avg.rename(columns={'volume': 'avg_volume'})
+
+# станции ниже порога
+low_origins = origin_avg[
+    origin_avg['avg_volume'] < ORIGIN_VOLUME_THRESHOLD
+]['origin']
+
+print("Слабые станции:", len(low_origins))
+
+
+# ------------------ ПЕРЕНОС В "ПРОЧЕЕ" ------------------
+df_low = df[df['origin'].isin(low_origins)].copy()
+df_good = df[~df['origin'].isin(low_origins)].copy()
+
+# всё слабое → прочее
+df_low[['destination', 'cargo_type', 'speed']] = 'прочее'
+
+# объединяем обратно
+df = pd.concat([df_good, df_low], ignore_index=True)
+
+# агрегируем
+df = df.groupby(
+    ['origin', 'destination', 'cargo_type', 'speed', 'month'],
+    as_index=False
+)['volume'].sum()
+
+print("После фильтра слабых станций:", df['origin'].nunique())
