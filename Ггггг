@@ -1,0 +1,161 @@
+import pandas as pd
+import psycopg2
+
+# ------------------ ПАРАМЕТРЫ ------------------
+CUTOFF_DATE = "2026-03-01"
+N_MONTHS = 3
+MIN_ACTIVE_MONTHS = 2
+TRAIN_COUNT = 10
+
+THRESHOLDS = {
+    'бензин': 20,
+    'нефть': 20,
+    'ДТ': 20,
+    'БГС': 20,
+    'мазут': 20,
+    'ТС-1': 20,
+    'ТНТ': 20,
+    'прочее': 30
+}
+
+# ------------------ ЗАГРУЗКА ------------------
+def get_query(query: str) -> pd.DataFrame:
+    with psycopg2.connect(
+        user="",
+        password="***",
+        host="***",
+        port="",
+        database="D"
+    ) as conn:
+        return pd.read_sql_query(query, conn)
+
+
+# ------------------ ДАННЫЕ ------------------
+df_raw = get_query("""SELECT * FROM MART.daria_data_rachet_delenie_obion""")
+
+plan_raw = get_query("""SELECT * FROM MART.daria_aktualnyj_plan_correktirovki""")
+
+plan_fact_raw = get_query("""SELECT * FROM MART.daria_actual_plan""")
+
+
+# ------------------ ПОДГОТОВКА ------------------
+df = df_raw.copy()
+df['date'] = pd.to_datetime(df['date'])
+df = df[df['date'] < CUTOFF_DATE]
+df['month'] = df['date'].dt.to_period("M")
+
+# ------------------ ФИЛЬТР ПО МЕСЯЦАМ ------------------
+last_month = df['month'].max()
+recent_months = [last_month - i for i in range(N_MONTHS)]
+
+def keep_group(x):
+    active = x[x['volume'] > 0]['month'].unique()
+    return len(set(active) & set(recent_months)) >= MIN_ACTIVE_MONTHS
+
+df = df.groupby(
+    ['origin', 'destination', 'cargo_type', 'speed']
+).filter(keep_group)
+
+print("После фильтра месяцев:", df['destination'].nunique())
+
+
+# ------------------ PLAN FACT ------------------
+plan_fact = plan_fact_raw.copy()
+plan_fact['date'] = pd.to_datetime(plan_fact['date'])
+plan_fact['month'] = plan_fact['date'].dt.to_period("M")
+
+plan_fact = plan_fact.groupby(
+    ['origin', 'destination', 'cargo_type', 'speed', 'month'],
+    as_index=False
+)['wagons'].sum()
+
+valid_pairs = plan_fact[
+    (plan_fact['month'] == last_month) &
+    (plan_fact['wagons'] >= TRAIN_COUNT)
+][['origin', 'destination', 'cargo_type', 'speed']]
+
+df['is_valid'] = df.merge(
+    valid_pairs,
+    on=['origin', 'destination', 'cargo_type', 'speed'],
+    how='left',
+    indicator=True
+)['_merge'] == 'both'
+
+print("После valid_pairs:", df['destination'].nunique())
+
+
+# ------------------ PLAN (объемы) ------------------
+plan = plan_raw.copy()
+plan['date'] = pd.to_datetime(plan['date'])
+
+plan = plan[plan['date'] == CUTOFF_DATE]
+
+plan_grouped = plan.groupby('origin', as_index=False)['volume'].sum()
+
+total_volume_by_origin = dict(zip(plan_grouped['origin'], plan_grouped['volume']))
+
+
+# ------------------ ПРОГНОЗ ------------------
+weights = {
+    last_month - 2: 0.1,
+    last_month - 1: 0.2,
+    last_month: 0.7
+}
+
+df['weight'] = df['month'].map(weights).fillna(0)
+df['weighted_volume'] = df['volume'] * df['weight']
+
+grouped = df.groupby(
+    ['origin', 'destination', 'cargo_type', 'speed'],
+    as_index=False
+)['weighted_volume'].sum()
+
+result = []
+
+for origin, total_vol in total_volume_by_origin.items():
+    sub = grouped[grouped['origin'] == origin].copy()
+
+    if sub.empty:
+        continue
+
+    total_weight = sub['weighted_volume'].sum()
+
+    if total_weight == 0:
+        sub['share'] = 1 / len(sub)
+    else:
+        sub['share'] = sub['weighted_volume'] / total_weight
+
+    sub['forecast_volume'] = sub['share'] * total_vol
+
+    result.append(sub)
+
+forecast_df = pd.concat(result, ignore_index=True)
+
+print("После forecast:", forecast_df['destination'].nunique())
+
+
+# ------------------ ПОРОГИ ------------------
+def apply_threshold(row):
+    limit = THRESHOLDS.get(row['cargo_type'], 30)
+    return row['forecast_volume'] >= limit
+
+forecast_df['is_big'] = forecast_df.apply(apply_threshold, axis=1)
+
+small = forecast_df[~forecast_df['is_big']].copy()
+small[['destination', 'cargo_type', 'speed']] = 'прочее'
+
+big = forecast_df[forecast_df['is_big']]
+
+forecast_final = pd.concat([big, small], ignore_index=True)
+
+forecast_final = forecast_final.groupby(
+    ['origin', 'destination', 'cargo_type', 'speed'],
+    as_index=False
+)['forecast_volume'].sum()
+
+
+print("ФИНАЛ направлений:", forecast_final['destination'].nunique())
+
+
+# ------------------ СОХРАНЕНИЕ ------------------
+forecast_final.to_excel("output_forecast.xlsx", index=False)
